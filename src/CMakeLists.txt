@@ -22,6 +22,8 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-transfer.cpp
+            llama-topology.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-recurrent.cpp

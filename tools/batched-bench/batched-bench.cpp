@@ -2,6 +2,8 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-topology.h"
+#include "llama-kv-transfer.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -34,6 +36,14 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // Display topology if requested
+    if (params.topology) {
+        llama_topology_info topology;
+        llama_topology_init_simple(&topology, params.prefill_devices, params.decode_devices);
+        llama_topology_print(&topology);
+        llama_topology_free(&topology);
+    }
 
     // initialize the model
 

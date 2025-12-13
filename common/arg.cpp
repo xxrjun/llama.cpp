@@ -2682,6 +2682,78 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
+        {"--prefill-devices"}, "LIST",
+        "comma separated list of devices for prefill (e.g., RPC@ip:port,CUDA0)",
+        [](common_params & params, const std::string & value) {
+            params.prefill_devices = string_split<std::string>(value, ',');
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--decode-devices"}, "LIST",
+        "comma separated list of devices for decode (e.g., Metal,CPU)",
+        [](common_params & params, const std::string & value) {
+            params.decode_devices = string_split<std::string>(value, ',');
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--disagg"},
+        "explicitly enable disaggregated prefill-decode mode",
+        [](common_params & params) {
+            params.disagg = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--no-disagg"},
+        "explicitly disable disaggregated mode (monolithic mode)",
+        [](common_params & params) {
+            params.disagg = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--topology"},
+        "display topology information (devices, network, bandwidth)",
+        [](common_params & params) {
+            params.topology = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--topology-file"}, "PATH",
+        "path to topology configuration file (YAML)",
+        [](common_params & params, const std::string & value) {
+            params.topology_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--kv-compression"}, "{none,zstd}",
+        "KV cache compression type (default: none). Note: zstd is not yet implemented.",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "none") { params.kv_compression = "none"; }
+            else if (value == "zstd") {
+                params.kv_compression = "zstd";
+                fprintf(stderr, "WARNING: --kv-compression zstd is not yet implemented. Data will NOT be compressed.\n");
+            }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--kv-stream"},
+        "enable KV streaming during prefill (emit frames incrementally)",
+        [](common_params & params) {
+            params.kv_stream = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--kv-stream-every"}, "N",
+        "KV streaming cadence: emit frame every N layers (default: 1, must be > 0)",
+        [](common_params & params, const std::string & value) {
+            int n = std::stoi(value);
+            if (n <= 0) {
+                throw std::invalid_argument("--kv-stream-every must be > 0");
+            }
+            params.kv_stream_every = n;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
         {"--log-disable"},
         "Log disable",
         [](common_params &) {

@@ -1927,6 +1927,411 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 //
+// Layer-specific KV state I/O for streaming support
+//
+
+llama_kv_cache::cell_ranges_t llama_kv_cache::build_cell_ranges_for_seq(llama_seq_id seq_id) const {
+    // Use stream 0 for now (single stream mode)
+    const uint32_t strm = 0;
+    cell_ranges_t cr { strm, {} };
+
+    if (strm >= v_cells.size()) {
+        return cr;
+    }
+
+    const auto & cells = v_cells[strm];
+
+    // Find all the ranges of cells with this seq id (or all, when -1)
+    uint32_t cell_range_begin = cells.size();
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && (seq_id == -1 || cells.seq_has(i, seq_id))) {
+            if (cell_range_begin == cells.size()) {
+                cell_range_begin = i;
+            }
+        } else {
+            if (cell_range_begin != cells.size()) {
+                cr.data.emplace_back(cell_range_begin, i);
+                cell_range_begin = cells.size();
+            }
+        }
+    }
+
+    if (cell_range_begin != cells.size()) {
+        cr.data.emplace_back(cell_range_begin, cells.size());
+    }
+
+    return cr;
+}
+
+size_t llama_kv_cache::layer_range_size(int32_t layer_start, int32_t layer_end) const {
+    size_t size = 0;
+
+    // Clamp to valid range
+    layer_start = std::max(0, layer_start);
+    layer_end = std::min((int32_t)layers.size(), layer_end);
+
+    if (layer_start >= layer_end) {
+        return 0;
+    }
+
+    // Account for header metadata written by state_write_data_layers:
+    // v_trans (4) + layer_start (4) + layer_end (4) + n_layer_range (4) = 16 bytes
+    size += 16;
+
+    // Sum up sizes for layers in range
+    for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+        const auto & layer = layers[idx];
+
+        // Per-layer key metadata: k_type_i (4) + k_size_row (8) = 12 bytes
+        size += 12;
+        size += ggml_nbytes(layer.k);
+
+        // Per-layer value metadata depends on v_trans
+        if (!v_trans) {
+            // v_type_i (4) + v_size_row (8) = 12 bytes
+            size += 12;
+        } else {
+            // v_type_i (4) + v_size_el (4) + n_embd_v_gqa (4) = 12 bytes
+            size += 12;
+        }
+        size += ggml_nbytes(layer.v);
+    }
+
+    return size;
+}
+
+size_t llama_kv_cache::layer_range_size_for_seq(llama_seq_id seq_id, int32_t layer_start, int32_t layer_end) const {
+    // Build cell ranges for the sequence
+    cell_ranges_t cr = build_cell_ranges_for_seq(seq_id);
+
+    // Count total cells in ranges
+    uint32_t cell_count = 0;
+    for (const auto & range : cr.data) {
+        cell_count += range.second - range.first;
+    }
+
+    if (cell_count == 0) {
+        return 0;
+    }
+
+    size_t size = 0;
+
+    // Clamp to valid range
+    layer_start = std::max(0, layer_start);
+    layer_end = std::min((int32_t)layers.size(), layer_end);
+
+    if (layer_start >= layer_end) {
+        return 0;
+    }
+
+    // Account for header metadata written by state_write_data_layers:
+    // v_trans (4) + layer_start (4) + layer_end (4) + n_layer_range (4) = 16 bytes
+    size += 16;
+
+    // Sum up sizes for layers in range (for the actual cells used)
+    for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+        const auto & layer = layers[idx];
+        const uint32_t il = layer.il;
+
+        // Per-layer key metadata: k_type_i (4) + k_size_row (8) = 12 bytes
+        size += 12;
+
+        // Key data size for the cells in this sequence
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const size_t k_size_row = ggml_row_size(layer.k->type, n_embd_k_gqa);
+        size += cell_count * k_size_row;
+
+        // Per-layer value metadata depends on v_trans
+        if (!v_trans) {
+            // v_type_i (4) + v_size_row (8) = 12 bytes
+            size += 12;
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            const size_t v_size_row = ggml_row_size(layer.v->type, n_embd_v_gqa);
+            size += cell_count * v_size_row;
+        } else {
+            // v_type_i (4) + v_size_el (4) + n_embd_v_gqa (4) = 12 bytes
+            size += 12;
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            const uint32_t v_size_el = ggml_type_size(layer.v->type);
+            size += n_embd_v_gqa * cell_count * v_size_el;
+        }
+    }
+
+    return size;
+}
+
+void llama_kv_cache::state_write_data_layers(llama_io_write_i & io, const cell_ranges_t & cr,
+                                               int32_t layer_start, int32_t layer_end) const {
+    const auto & cells = v_cells[cr.strm];
+
+    const uint32_t v_trans = this->v_trans ? 1 : 0;
+
+    // Clamp to valid range
+    layer_start = std::max(0, layer_start);
+    layer_end = std::min((int32_t)layers.size(), layer_end);
+
+    if (layer_start >= layer_end) {
+        LLAMA_LOG_WARN("%s: invalid layer range [%d, %d)\n", __func__, layer_start, layer_end);
+        return;
+    }
+
+    const uint32_t n_layer_range = layer_end - layer_start;
+
+    // Write metadata
+    io.write(&v_trans, sizeof(v_trans));
+    io.write(&layer_start, sizeof(layer_start));
+    io.write(&layer_end, sizeof(layer_end));
+    io.write(&n_layer_range, sizeof(n_layer_range));
+
+    // Write keys for layers in range
+    for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+        const auto & layer = layers[idx];
+        const uint32_t il = layer.il;
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+
+        auto * k = layer.k_stream[cr.strm];
+
+        // Write key type
+        const int32_t k_type_i = (int32_t) k->type;
+        io.write(&k_type_i, sizeof(k_type_i));
+
+        // Write row size of key
+        const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+        io.write(&k_size_row, sizeof(k_size_row));
+
+        // Write each range of cells
+        for (const auto & range : cr.data) {
+            const size_t range_size = range.second - range.first;
+            const size_t buf_size = range_size * k_size_row;
+            io.write_tensor(k, range.first * k_size_row, buf_size);
+        }
+    }
+
+    // Write values for layers in range
+    if (!v_trans) {
+        for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+            const auto & layer = layers[idx];
+            const uint32_t il = layer.il;
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+            auto * v = layer.v_stream[cr.strm];
+
+            // Write value type
+            const int32_t v_type_i = (int32_t) v->type;
+            io.write(&v_type_i, sizeof(v_type_i));
+
+            // Write row size of value
+            const uint64_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+            io.write(&v_size_row, sizeof(v_size_row));
+
+            // Write each range of cells
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * v_size_row;
+                io.write_tensor(v, range.first * v_size_row, buf_size);
+            }
+        }
+    } else {
+        // Transposed V cache
+        const uint32_t kv_size = cells.size();
+
+        for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+            const auto & layer = layers[idx];
+            const uint32_t il = layer.il;
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+            auto * v = layer.v_stream[cr.strm];
+
+            // Write value type
+            const int32_t v_type_i = (int32_t) v->type;
+            io.write(&v_type_i, sizeof(v_type_i));
+
+            // Write element size
+            const uint32_t v_size_el = ggml_type_size(v->type);
+            io.write(&v_size_el, sizeof(v_size_el));
+
+            // Write GQA embedding size
+            io.write(&n_embd_v_gqa, sizeof(n_embd_v_gqa));
+
+            // For each row, write the element values of each cell
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t src_offset = (range.first + j * kv_size) * v_size_el;
+                    const size_t buf_size = range_size * v_size_el;
+                    io.write_tensor(v, src_offset, buf_size);
+                }
+            }
+        }
+    }
+}
+
+bool llama_kv_cache::state_read_data_layers(llama_io_read_i & io, const cell_ranges_t & cr,
+                                              int32_t layer_start, int32_t layer_end) {
+    const auto & cells = v_cells[cr.strm];
+    auto & head = v_heads[cr.strm];
+
+    uint32_t v_trans;
+    int32_t  layer_start_ref;
+    int32_t  layer_end_ref;
+    uint32_t n_layer_range;
+
+    io.read_to(&v_trans, sizeof(v_trans));
+    io.read_to(&layer_start_ref, sizeof(layer_start_ref));
+    io.read_to(&layer_end_ref, sizeof(layer_end_ref));
+    io.read_to(&n_layer_range, sizeof(n_layer_range));
+
+    // Validate layer range
+    if (layer_start_ref != layer_start || layer_end_ref != layer_end) {
+        LLAMA_LOG_ERROR("%s: layer range mismatch ([%d, %d) vs [%d, %d))\n",
+                        __func__, layer_start, layer_end, layer_start_ref, layer_end_ref);
+        return false;
+    }
+
+    if (n_layer_range != (uint32_t)(layer_end - layer_start)) {
+        LLAMA_LOG_ERROR("%s: layer count mismatch (%u vs %d)\n",
+                        __func__, n_layer_range, layer_end - layer_start);
+        return false;
+    }
+
+    if (this->v_trans != (bool) v_trans) {
+        LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
+        return false;
+    }
+
+    // Compute cell count from cell ranges
+    uint32_t cell_count = 0;
+    for (const auto & range : cr.data) {
+        cell_count += range.second - range.first;
+    }
+
+    // Read keys for layers in range
+    for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+        const auto & layer = layers[idx];
+        const uint32_t il = layer.il;
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+
+        auto * k = layer.k_stream[cr.strm];
+
+        // Read key type
+        int32_t k_type_i_ref;
+        io.read_to(&k_type_i_ref, sizeof(k_type_i_ref));
+        const int32_t k_type_i = (int32_t) k->type;
+        if (k_type_i != k_type_i_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n",
+                            __func__, k_type_i, k_type_i_ref, il);
+            return false;
+        }
+
+        // Read row size of key
+        uint64_t k_size_row_ref;
+        io.read_to(&k_size_row_ref, sizeof(k_size_row_ref));
+        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+        if (k_size_row != k_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n",
+                            __func__, k_size_row, (size_t) k_size_row_ref, il);
+            return false;
+        }
+
+        // Read each range of cells
+        for (const auto & range : cr.data) {
+            const size_t range_size = range.second - range.first;
+            const size_t buf_size = range_size * k_size_row;
+            ggml_backend_tensor_set(k, io.read(buf_size), range.first * k_size_row, buf_size);
+        }
+    }
+
+    // Read values for layers in range
+    if (!this->v_trans) {
+        for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+            const auto & layer = layers[idx];
+            const uint32_t il = layer.il;
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+            auto * v = layer.v_stream[cr.strm];
+
+            // Read value type
+            int32_t v_type_i_ref;
+            io.read_to(&v_type_i_ref, sizeof(v_type_i_ref));
+            const int32_t v_type_i = (int32_t) v->type;
+            if (v_type_i != v_type_i_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n",
+                                __func__, v_type_i, v_type_i_ref, il);
+                return false;
+            }
+
+            // Read row size of value
+            uint64_t v_size_row_ref;
+            io.read_to(&v_size_row_ref, sizeof(v_size_row_ref));
+            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+            if (v_size_row != v_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n",
+                                __func__, v_size_row, (size_t) v_size_row_ref, il);
+                return false;
+            }
+
+            // Read each range of cells
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * v_size_row;
+                ggml_backend_tensor_set(v, io.read(buf_size), range.first * v_size_row, buf_size);
+            }
+        }
+    } else {
+        // Transposed V cache
+        for (int32_t idx = layer_start; idx < layer_end; ++idx) {
+            const auto & layer = layers[idx];
+            const uint32_t il = layer.il;
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+            auto * v = layer.v_stream[cr.strm];
+
+            // Read value type
+            int32_t v_type_i_ref;
+            io.read_to(&v_type_i_ref, sizeof(v_type_i_ref));
+            const int32_t v_type_i = (int32_t) v->type;
+            if (v_type_i != v_type_i_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n",
+                                __func__, v_type_i, v_type_i_ref, il);
+                return false;
+            }
+
+            // Read element size
+            uint32_t v_size_el_ref;
+            io.read_to(&v_size_el_ref, sizeof(v_size_el_ref));
+            const size_t v_size_el = ggml_type_size(v->type);
+            if (v_size_el != v_size_el_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n",
+                                __func__, v_size_el, (size_t) v_size_el_ref, il);
+                return false;
+            }
+
+            // Read GQA embedding size
+            uint32_t n_embd_v_gqa_ref;
+            io.read_to(&n_embd_v_gqa_ref, sizeof(n_embd_v_gqa_ref));
+            if (n_embd_v_gqa != n_embd_v_gqa_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched GQA embedding size (%u != %u, layer %d)\n",
+                                __func__, n_embd_v_gqa, n_embd_v_gqa_ref, il);
+                return false;
+            }
+
+            // For each row in the transposed matrix, read the values
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t dst_offset = (range.first + j * cells.size()) * v_size_el;
+                    const size_t buf_size = range_size * v_size_el;
+                    ggml_backend_tensor_set(v, io.read(buf_size), dst_offset, buf_size);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+//
 // llama_kv_cache_context
 //
 

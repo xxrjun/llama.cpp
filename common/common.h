@@ -301,6 +301,27 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// KV cache transfer statistics for prefill-decode disaggregation
+struct kv_transfer_stats {
+    size_t kv_bytes_sent = 0;      // total bytes sent (prefill tier)
+    size_t kv_bytes_recv = 0;      // total bytes received (decode tier)
+    double kv_transfer_ms = 0.0;   // total transfer time in milliseconds
+    double kv_bandwidth_mbps = 0.0; // calculated bandwidth in Mbps
+    int32_t kv_frames = 0;         // number of KV frames transferred
+    int32_t kv_checksum_failures = 0; // checksum validation failures
+    int32_t kv_retries = 0;        // number of retry attempts
+
+    void reset() {
+        kv_bytes_sent = 0;
+        kv_bytes_recv = 0;
+        kv_transfer_ms = 0.0;
+        kv_bandwidth_mbps = 0.0;
+        kv_frames = 0;
+        kv_checksum_failures = 0;
+        kv_retries = 0;
+    }
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // new tokens to predict
     int32_t n_ctx                 =  4096; // context size
@@ -500,6 +521,16 @@ struct common_params {
     std::vector<int32_t> n_pp;
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
+
+    // prefill-decode disaggregation params
+    std::vector<std::string> prefill_devices;  // devices for prefill (e.g., "RPC@ip:port", "CUDA0")
+    std::vector<std::string> decode_devices;   // devices for decode (e.g., "Metal", "CPU")
+    bool disagg                = false;        // explicitly enable disaggregated mode
+    bool topology              = false;        // display topology information
+    std::string topology_file  = "";           // path to topology config file (YAML)
+    std::string kv_compression = "none";       // KV compression type: "none", "zstd"
+    bool kv_stream             = false;        // enable KV streaming during prefill
+    int32_t kv_stream_every    = 1;            // KV streaming cadence (emit frame every N layers)
 
     // retrieval params
     std::vector<std::string> context_files; // context files to embed

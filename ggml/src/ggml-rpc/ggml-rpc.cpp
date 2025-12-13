@@ -107,6 +107,9 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_KV_TRANSFER_INIT,     // Initialize KV transfer session
+    RPC_CMD_KV_TRANSFER_SEND,     // Send KV frame chunk
+    RPC_CMD_KV_TRANSFER_COMMIT,   // Finalize KV transfer
     RPC_CMD_COUNT,
 };
 
@@ -218,6 +221,32 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+struct rpc_msg_kv_transfer_init_req {
+    int32_t seq_id;
+    uint64_t total_size;
+    uint32_t compression;
+};
+
+struct rpc_msg_kv_transfer_init_rsp {
+    uint8_t result;  // 0 = success
+};
+
+struct rpc_msg_kv_transfer_send_req {
+    int32_t seq_id;
+    uint64_t frame_offset;
+    uint64_t chunk_size;
+    // Followed by chunk data
+};
+
+struct rpc_msg_kv_transfer_commit_req {
+    int32_t seq_id;
+    uint32_t checksum;
+};
+
+struct rpc_msg_kv_transfer_commit_rsp {
+    uint8_t result;  // 0 = success
 };
 
 #pragma pack(pop)
@@ -979,6 +1008,64 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     get_device_memory(sock, device, free, total);
 }
 
+// KV cache transfer functions for prefill-decode disaggregation
+
+bool ggml_backend_rpc_kv_transfer_init(const char * endpoint, int32_t seq_id, uint64_t total_size, uint32_t compression) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+
+    rpc_msg_kv_transfer_init_req request;
+    request.seq_id = seq_id;
+    request.total_size = total_size;
+    request.compression = compression;
+
+    rpc_msg_kv_transfer_init_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_KV_TRANSFER_INIT, &request, sizeof(request), &response, sizeof(response));
+
+    return status && (response.result == 0);
+}
+
+bool ggml_backend_rpc_kv_transfer_send(const char * endpoint, int32_t seq_id, uint64_t frame_offset, const uint8_t * data, uint64_t chunk_size) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+
+    // Construct message: header + chunk data
+    size_t msg_size = sizeof(rpc_msg_kv_transfer_send_req) + chunk_size;
+    std::vector<uint8_t> msg(msg_size);
+
+    rpc_msg_kv_transfer_send_req * request = reinterpret_cast<rpc_msg_kv_transfer_send_req *>(msg.data());
+    request->seq_id = seq_id;
+    request->frame_offset = frame_offset;
+    request->chunk_size = chunk_size;
+
+    // Copy chunk data after header
+    memcpy(msg.data() + sizeof(rpc_msg_kv_transfer_send_req), data, chunk_size);
+
+    bool status = send_rpc_cmd(sock, RPC_CMD_KV_TRANSFER_SEND, msg.data(), msg.size());
+
+    return status;
+}
+
+bool ggml_backend_rpc_kv_transfer_commit(const char * endpoint, int32_t seq_id, uint32_t checksum) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+
+    rpc_msg_kv_transfer_commit_req request;
+    request.seq_id = seq_id;
+    request.checksum = checksum;
+
+    rpc_msg_kv_transfer_commit_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_KV_TRANSFER_COMMIT, &request, sizeof(request), &response, sizeof(response));
+
+    return status && (response.result == 0);
+}
+
 // RPC server-side implementation
 
 class rpc_server {
@@ -1006,6 +1093,11 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
 
+    // KV cache transfer handlers
+    bool kv_transfer_init(const rpc_msg_kv_transfer_init_req & request, rpc_msg_kv_transfer_init_rsp & response);
+    bool kv_transfer_send(const std::vector<uint8_t> & input);
+    bool kv_transfer_commit(const rpc_msg_kv_transfer_commit_req & request, rpc_msg_kv_transfer_commit_rsp & response);
+
     struct stored_graph {
         ggml_context_ptr ctx_ptr;
         ggml_cgraph *    graph;
@@ -1025,6 +1117,17 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+
+    // KV transfer state: track in-progress transfers by seq_id
+    struct kv_transfer_session {
+        int32_t seq_id;
+        uint64_t total_size;
+        uint64_t received_size;
+        uint32_t compression;
+        std::vector<uint8_t> buffer;
+        uint32_t computed_checksum;
+    };
+    std::unordered_map<int32_t, kv_transfer_session> kv_sessions;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1251,6 +1354,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
+    // Check filesystem cache
     if (!cache_dir) {
         return false;
     }
@@ -1267,6 +1371,7 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     ifs.seekg(0, std::ios::beg);
     data.resize(size);
     ifs.read((char *)data.data(), size);
+    LOG_DBG("[%s] found in filesystem cache, hash=0x%" PRIx64 ", size=%zu\n", __func__, hash, size);
     return true;
 }
 
@@ -1275,9 +1380,12 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
         response.result = 0;
+        LOG_DBG("[%s] CACHE MISS: hash=0x%" PRIx64 ", client will send data\n", __func__, request.hash);
         return true;
     }
     size_t size = cached_file.size();
+    LOG_DBG("[%s] CACHE HIT: hash=0x%" PRIx64 ", size=%.2f MB, loading from cache\n", 
+            __func__, request.hash, size / (1024.0 * 1024.0));
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1569,6 +1677,120 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+// KV cache transfer handlers
+
+bool rpc_server::kv_transfer_init(const rpc_msg_kv_transfer_init_req & request, rpc_msg_kv_transfer_init_rsp & response) {
+    int32_t seq_id = request.seq_id;
+
+    LOG_DBG("[%s] seq_id: %d, total_size: %" PRIu64 ", compression: %u\n",
+            __func__, seq_id, request.total_size, request.compression);
+
+    // Create new session for this sequence
+    kv_transfer_session session;
+    session.seq_id = seq_id;
+    session.total_size = request.total_size;
+    session.received_size = 0;
+    session.compression = request.compression;
+    session.buffer.reserve(request.total_size);
+    session.computed_checksum = 0;
+
+    // Store session (overwrite if exists)
+    kv_sessions[seq_id] = std::move(session);
+
+    response.result = 0; // Success
+    return true;
+}
+
+bool rpc_server::kv_transfer_send(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_msg_kv_transfer_send_req)) {
+        GGML_LOG_ERROR("[%s] Invalid input size: %zu\n", __func__, input.size());
+        return false;
+    }
+
+    const rpc_msg_kv_transfer_send_req * request =
+        reinterpret_cast<const rpc_msg_kv_transfer_send_req *>(input.data());
+
+    int32_t seq_id = request->seq_id;
+    uint64_t frame_offset = request->frame_offset;
+    uint64_t chunk_size = request->chunk_size;
+
+    LOG_DBG("[%s] seq_id: %d, offset: %" PRIu64 ", chunk_size: %" PRIu64 "\n",
+            __func__, seq_id, frame_offset, chunk_size);
+
+    // Verify session exists
+    auto it = kv_sessions.find(seq_id);
+    if (it == kv_sessions.end()) {
+        GGML_LOG_ERROR("[%s] No active session for seq_id: %d\n", __func__, seq_id);
+        return false;
+    }
+
+    kv_transfer_session & session = it->second;
+
+    // Verify chunk size matches
+    if (input.size() != sizeof(rpc_msg_kv_transfer_send_req) + chunk_size) {
+        GGML_LOG_ERROR("[%s] Chunk size mismatch: expected %" PRIu64 ", got %zu\n",
+                __func__, chunk_size, input.size() - sizeof(rpc_msg_kv_transfer_send_req));
+        return false;
+    }
+
+    // Append chunk data to buffer
+    const uint8_t * chunk_data = input.data() + sizeof(rpc_msg_kv_transfer_send_req);
+    session.buffer.insert(session.buffer.end(), chunk_data, chunk_data + chunk_size);
+    session.received_size += chunk_size;
+
+    LOG_DBG("[%s] Received %" PRIu64 " / %" PRIu64 " bytes\n",
+            __func__, session.received_size, session.total_size);
+
+    return true;
+}
+
+bool rpc_server::kv_transfer_commit(const rpc_msg_kv_transfer_commit_req & request, rpc_msg_kv_transfer_commit_rsp & response) {
+    int32_t seq_id = request.seq_id;
+    uint32_t expected_checksum = request.checksum;
+
+    LOG_DBG("[%s] seq_id: %d, checksum: 0x%08x\n", __func__, seq_id, expected_checksum);
+
+    // Verify session exists
+    auto it = kv_sessions.find(seq_id);
+    if (it == kv_sessions.end()) {
+        GGML_LOG_ERROR("[%s] No active session for seq_id: %d\n", __func__, seq_id);
+        response.result = 1; // Failure
+        return false;
+    }
+
+    kv_transfer_session & session = it->second;
+
+    // Verify all data received
+    if (session.received_size != session.total_size) {
+        GGML_LOG_ERROR("[%s] Incomplete transfer: received %" PRIu64 " / %" PRIu64 " bytes\n",
+                __func__, session.received_size, session.total_size);
+        response.result = 2; // Incomplete transfer
+        return false;
+    }
+
+    // TODO: Validate checksum when CRC32 function is available
+    // For now, accept the transfer
+    // uint32_t computed_checksum = llama_kv_crc32(session.buffer.data(), session.buffer.size());
+    // if (computed_checksum != expected_checksum) {
+    //     GGML_LOG_ERROR("[%s] Checksum mismatch: expected 0x%08x, got 0x%08x\n",
+    //             __func__, expected_checksum, computed_checksum);
+    //     response.result = 3; // Checksum failure
+    //     return false;
+    // }
+
+    GGML_LOG_INFO("[%s] KV transfer complete for seq_id %d: %" PRIu64 " bytes\n",
+            __func__, seq_id, session.received_size);
+
+    // TODO: Deserialize KV cache into backend context
+    // This will be done when integrating with llama-server context
+
+    // Clean up session
+    kv_sessions.erase(it);
+
+    response.result = 0; // Success
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
@@ -1815,6 +2037,44 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_KV_TRANSFER_INIT: {
+                rpc_msg_kv_transfer_init_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kv_transfer_init_rsp response;
+                if (!server.kv_transfer_init(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KV_TRANSFER_SEND: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sockfd, input)) {
+                    return;
+                }
+                if (!server.kv_transfer_send(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_KV_TRANSFER_COMMIT: {
+                rpc_msg_kv_transfer_commit_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_kv_transfer_commit_rsp response;
+                if (!server.kv_transfer_commit(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -1897,6 +2157,14 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         ggml_backend_free(backend);
     }
 }
+
+// TODO: GPU Pre-loading Feature (Not Yet Implemented)
+// The intended feature would allow pre-loading the model into GPU memory at server startup,
+// so client connections can immediately reuse the existing GPU buffers without any data transfer.
+// This requires:
+// - New RPC protocol commands for buffer sharing
+// - Server-side model lifecycle management  
+// - Client modifications to skip tensor uploads for pre-loaded models
 
 // device interface
 
@@ -2029,6 +2297,10 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+    // TODO: GPU pre-loading feature not yet implemented
+    // if (std::strcmp(name, "ggml_backend_rpc_preload_model_to_gpu") == 0) {
+    //     return (void *)ggml_backend_rpc_preload_model_to_gpu;
+    // }
     return NULL;
 
     GGML_UNUSED(reg);

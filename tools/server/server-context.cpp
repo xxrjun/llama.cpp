@@ -7,6 +7,7 @@
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
+#include "llama-kv-transfer.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -75,6 +76,22 @@ struct server_slot {
     // TODO: change to unique_ptrs for consistency:
     llama_context * ctx = nullptr;
     llama_context * ctx_dft = nullptr;
+
+    // Prefill-decode disaggregation support
+    llama_context * ctx_prefill = nullptr;  // Context for prefill (may be RPC)
+    llama_context * ctx_decode = nullptr;   // Context for decode (local)
+    bool is_disaggregated = false;          // Enable split execution
+
+    // KV transfer state
+    enum kv_transfer_state {
+        KV_NONE,                            // No transfer needed
+        KV_IN_PROGRESS,                     // Streaming frames
+        KV_COMPLETE                         // All frames received
+    };
+    kv_transfer_state kv_state = KV_NONE;
+    std::vector<uint8_t> kv_buffer;         // Accumulated KV frames
+    llama_kv_transfer_stats kv_stats = {};
+    int32_t last_layer_transferred = 0;     // For streaming
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -516,6 +533,15 @@ struct server_context_impl {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
 
+    // Prefill-decode disaggregation support
+    common_init_result llama_init_prefill;
+    common_init_result llama_init_decode;
+    llama_model * model_prefill = nullptr;
+    llama_model * model_decode = nullptr;
+    llama_context * ctx_prefill = nullptr;
+    llama_context * ctx_decode = nullptr;
+    bool is_disaggregated = false;
+
     // multimodal
     mtmd_context * mctx = nullptr;
 
@@ -693,6 +719,17 @@ struct server_context_impl {
         return true;
     }
 
+    // Helper function to initialize disaggregated contexts
+    bool init_disaggregated_contexts() {
+        // TODO: Disaggregated mode for server not yet implemented
+        // This would require:
+        // 1. Parse --prefill-devices and --decode-devices
+        // 2. Load separate models for prefill and decode tiers
+        // 3. Create contexts with appropriate backend configurations
+        // 4. Implement GPU pre-loading on RPC server side
+        return false;
+    }
+
     // initialize slots and server-related data
     void init() {
         // wiring up server queues
@@ -702,6 +739,9 @@ struct server_context_impl {
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+
+        // Initialize disaggregated contexts if configured
+        init_disaggregated_contexts();
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -725,6 +765,16 @@ struct server_context_impl {
             slot.n_ctx = n_ctx_slot;
             slot.mctx = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+            // Setup disaggregated contexts if enabled
+            if (is_disaggregated) {
+                slot.is_disaggregated = true;
+                slot.ctx_prefill = ctx_prefill;
+                slot.ctx_decode = ctx_decode;
+                slot.kv_state = server_slot::KV_NONE;
+                llama_kv_transfer_stats_init(&slot.kv_stats);
+                SLT_INF(slot, "%s", "slot configured for disaggregated execution\n");
+            }
 
             if (model_dft) {
                 slot.batch_spec = llama_batch_init(params_base.speculative.n_max + 1, 0, 1);

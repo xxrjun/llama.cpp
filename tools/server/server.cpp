@@ -5,6 +5,8 @@
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
+#include "llama-topology.h"
+#include "llama-kv-transfer.h"
 #include "log.h"
 
 #include <atomic>
@@ -101,6 +103,14 @@ int main(int argc, char ** argv, char ** envp) {
     LOG_INF("\n");
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     LOG_INF("\n");
+
+    // Display topology if requested
+    if (params.topology) {
+        llama_topology_info topology;
+        llama_topology_init_simple(&topology, params.prefill_devices, params.decode_devices);
+        llama_topology_print(&topology);
+        llama_topology_free(&topology);
+    }
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {

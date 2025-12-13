@@ -182,6 +182,24 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // Publicly accessible for KV transfer
+    struct cell_ranges_t {
+        uint32_t strm;
+
+        std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
+    };
+
+    // Build cell ranges for a specific sequence (for KV streaming)
+    cell_ranges_t build_cell_ranges_for_seq(llama_seq_id seq_id) const;
+
+    // Layer-specific state I/O for streaming support
+    size_t layer_range_size(int32_t layer_start, int32_t layer_end) const;
+    size_t layer_range_size_for_seq(llama_seq_id seq_id, int32_t layer_start, int32_t layer_end) const;
+    void state_write_data_layers(llama_io_write_i & io, const cell_ranges_t & cr,
+                                  int32_t layer_start, int32_t layer_end) const;
+    bool state_read_data_layers(llama_io_read_i & io, const cell_ranges_t & cr,
+                                 int32_t layer_start, int32_t layer_end);
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -254,12 +272,6 @@ private:
     ggml_cgraph * build_graph_shift(
                llm_graph_result * res,
                   llama_context * lctx) const;
-
-    struct cell_ranges_t {
-        uint32_t strm;
-
-        std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
-    };
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
