@@ -541,14 +541,13 @@ static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    // Keep strong references so the connection stays open across RPC commands
+    static std::unordered_map<std::string, std::shared_ptr<socket_t>> sockets;
     static bool initialized = false;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
-        }
+        return it->second;
     }
     std::string host;
     int port;

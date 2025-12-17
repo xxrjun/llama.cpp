@@ -17,7 +17,32 @@
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s -m model.gguf -c 2048 -b 2048 -ub 512 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32 [-pps]\n", argv[0]);
+    LOG("         [--no-kv-checksum] to skip CRC on KV transfer\n");
     LOG("\n");
+}
+
+static bool parse_local_flags(int & argc, char ** argv, bool & disable_kv_checksum) {
+    std::vector<char *> filtered;
+    filtered.reserve(argc);
+    filtered.push_back(argv[0]);
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--no-kv-checksum") == 0) {
+            disable_kv_checksum = true;
+        } else {
+            filtered.push_back(argv[i]);
+        }
+    }
+
+    filtered.push_back(nullptr);
+
+    // rewrite argv/argc for downstream parsing
+    argc = static_cast<int>(filtered.size()) - 1;
+    for (int i = 0; i < argc; ++i) {
+        argv[i] = filtered[i];
+    }
+    argv[argc] = nullptr;
+    return true;
 }
 
 // Helper function to parse endpoint from device string (e.g., "RPC@ip:port=/path" -> "ip:port")
@@ -262,6 +287,14 @@ struct disagg_context {
     std::vector<uint8_t> kv_buffer;
     llama_kv_transfer_stats kv_stats;
 
+    // Last transfer phase timings (for logging outside the table)
+    double last_serialize_ms = 0.0;
+    double last_send_ms = 0.0;
+    double last_commit_ms = 0.0;
+    double last_deserialize_ms = 0.0;
+    size_t last_bytes = 0;
+    int last_frames = 0;
+
     // Cumulative checksum for streaming mode
     uint32_t cumulative_checksum = 0;
 };
@@ -273,11 +306,17 @@ static bool transfer_kv_via_rpc(
     llama_seq_id seq_id,
     bool use_streaming,
     int32_t stream_cadence,
-    int32_t n_layers) {
+    int32_t n_layers,
+    bool disable_kv_checksum) {
 
     const std::string & endpoint = disagg.rpc_endpoint;
 
     auto t_start = std::chrono::high_resolution_clock::now();
+    double serialize_ms = 0.0;
+    double send_ms = 0.0;
+    double commit_ms = 0.0;
+    size_t bytes_this = 0;
+    int frames_this = 0;
 
     if (use_streaming && stream_cadence > 0 && n_layers > 0) {
         // Layer streaming mode: send KV in chunks
@@ -325,10 +364,13 @@ static bool transfer_kv_via_rpc(
             }
 
             // Serialize layer range
+            auto t_ser_start = std::chrono::high_resolution_clock::now();
             size_t chunk_size = llama_kv_stream_serialize(
                 ctx_src, seq_id, layer, layer_end,
                 LLAMA_KV_COMPRESSION_NONE,
                 disagg.kv_buffer.data(), disagg.kv_buffer.size());
+            auto t_ser_end = std::chrono::high_resolution_clock::now();
+            serialize_ms += std::chrono::duration<double, std::milli>(t_ser_end - t_ser_start).count();
 
             if (chunk_size == 0) {
                 LOG_ERR("Failed to serialize KV layers [%d, %d) for seq %d\n", layer, layer_end, seq_id);
@@ -336,27 +378,36 @@ static bool transfer_kv_via_rpc(
             }
 
             // Send chunk over RPC
+            auto t_send_start = std::chrono::high_resolution_clock::now();
             if (!ggml_backend_rpc_kv_transfer_send(
                     endpoint.c_str(), seq_id, total_sent,
                     disagg.kv_buffer.data(), chunk_size)) {
                 LOG_ERR("Failed to send KV chunk for seq %d, layers [%d, %d)\n", seq_id, layer, layer_end);
                 return false;
             }
+            auto t_send_end = std::chrono::high_resolution_clock::now();
+            send_ms += std::chrono::duration<double, std::milli>(t_send_end - t_send_start).count();
 
-            // Accumulate checksum for all chunks (XOR of individual checksums)
-            disagg.cumulative_checksum ^= llama_kv_crc32(disagg.kv_buffer.data(), chunk_size);
+            if (!disable_kv_checksum) {
+                disagg.cumulative_checksum ^= llama_kv_crc32(disagg.kv_buffer.data(), chunk_size);
+            }
 
             total_sent += chunk_size;
             disagg.kv_stats.frame_count++;  // Count each chunk as a frame
+            frames_this++;
             layer = layer_end;
         }
 
         // Commit the transfer with cumulative checksum (covers all chunks)
-        if (!ggml_backend_rpc_kv_transfer_commit(endpoint.c_str(), seq_id, disagg.cumulative_checksum)) {
+        const uint32_t checksum = disable_kv_checksum ? 0 : disagg.cumulative_checksum;
+        auto t_commit_start = std::chrono::high_resolution_clock::now();
+        if (!ggml_backend_rpc_kv_transfer_commit(endpoint.c_str(), seq_id, checksum)) {
             LOG_ERR("Failed to commit RPC KV transfer for seq %d\n", seq_id);
             disagg.kv_stats.checksum_failures++;
             return false;
         }
+        auto t_commit_end = std::chrono::high_resolution_clock::now();
+        commit_ms = std::chrono::duration<double, std::milli>(t_commit_end - t_commit_start).count();
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -364,6 +415,7 @@ static bool transfer_kv_via_rpc(
         // Update stats: add bytes and time, but frame_count was already incremented per chunk
         disagg.kv_stats.bytes_sent += total_sent;
         disagg.kv_stats.transfer_time_ms += time_ms;
+        bytes_this = total_sent;
         if (disagg.kv_stats.transfer_time_ms > 0.0) {
             disagg.kv_stats.bandwidth_mbps = (disagg.kv_stats.bytes_sent * 8.0 / 1000000.0) / (disagg.kv_stats.transfer_time_ms / 1000.0);
         }
@@ -382,9 +434,12 @@ static bool transfer_kv_via_rpc(
         }
 
         // Serialize complete frame
+        auto t_ser_start = std::chrono::high_resolution_clock::now();
         size_t actual_size = llama_kv_frame_serialize(
             ctx_src, seq_id, LLAMA_KV_COMPRESSION_NONE,
             disagg.kv_buffer.data(), disagg.kv_buffer.size());
+        auto t_ser_end = std::chrono::high_resolution_clock::now();
+        serialize_ms = std::chrono::duration<double, std::milli>(t_ser_end - t_ser_start).count();
 
         if (actual_size == 0) {
             LOG_ERR("Failed to serialize KV cache for seq %d\n", seq_id);
@@ -398,25 +453,43 @@ static bool transfer_kv_via_rpc(
         }
 
         // Send full KV frame
+        auto t_send_start = std::chrono::high_resolution_clock::now();
         if (!ggml_backend_rpc_kv_transfer_send(endpoint.c_str(), seq_id, 0, disagg.kv_buffer.data(), actual_size)) {
             LOG_ERR("Failed to send KV frame for seq %d\n", seq_id);
             return false;
         }
+        auto t_send_end = std::chrono::high_resolution_clock::now();
+        send_ms = std::chrono::duration<double, std::milli>(t_send_end - t_send_start).count();
 
         // Commit with checksum (calculate on payload, excluding header for consistency)
         // Note: For full frame mode, the checksum is on the serialized data after the header
-        uint32_t checksum = llama_kv_crc32(disagg.kv_buffer.data() + sizeof(llama_kv_frame_header),
-                                            actual_size - sizeof(llama_kv_frame_header));
+        uint32_t checksum = 0;
+        if (!disable_kv_checksum) {
+            checksum = llama_kv_crc32(disagg.kv_buffer.data() + sizeof(llama_kv_frame_header),
+                                      actual_size - sizeof(llama_kv_frame_header));
+        }
+        auto t_commit_start = std::chrono::high_resolution_clock::now();
         if (!ggml_backend_rpc_kv_transfer_commit(endpoint.c_str(), seq_id, checksum)) {
             LOG_ERR("Failed to commit RPC KV transfer for seq %d\n", seq_id);
             disagg.kv_stats.checksum_failures++;
             return false;
         }
+        auto t_commit_end = std::chrono::high_resolution_clock::now();
+        commit_ms = std::chrono::duration<double, std::milli>(t_commit_end - t_commit_start).count();
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         llama_kv_transfer_stats_update(&disagg.kv_stats, actual_size, time_ms, true);
+        bytes_this = actual_size;
+        frames_this = 1;
     }
+
+    disagg.last_serialize_ms = serialize_ms;
+    disagg.last_send_ms = send_ms;
+    disagg.last_commit_ms = commit_ms;
+    disagg.last_deserialize_ms = 0.0;
+    disagg.last_bytes = bytes_this;
+    disagg.last_frames = frames_this;
 
     return true;
 }
@@ -429,9 +502,14 @@ static bool transfer_kv_in_memory(
     llama_seq_id seq_id,
     bool use_streaming,
     int32_t stream_cadence,
-    int32_t n_layers) {
+    int32_t n_layers,
+        bool disable_kv_checksum) {
 
     auto t_start = std::chrono::high_resolution_clock::now();
+    double serialize_ms = 0.0;
+    double deserialize_ms = 0.0;
+    size_t bytes_this = 0;
+    int frames_this = 0;
 
     if (use_streaming && stream_cadence > 0 && n_layers > 0) {
         // Layer streaming mode
@@ -454,10 +532,13 @@ static bool transfer_kv_in_memory(
             }
 
             // Serialize layer range
+            auto t_ser_start = std::chrono::high_resolution_clock::now();
             size_t actual_size = llama_kv_stream_serialize(
                 ctx_src, seq_id, layer, layer_end,
                 LLAMA_KV_COMPRESSION_NONE,
                 disagg.kv_buffer.data(), disagg.kv_buffer.size());
+            auto t_ser_end = std::chrono::high_resolution_clock::now();
+            serialize_ms += std::chrono::duration<double, std::milli>(t_ser_end - t_ser_start).count();
 
             if (actual_size == 0) {
                 LOG_ERR("Failed to serialize KV layers [%d, %d) for seq %d\n", layer, layer_end, seq_id);
@@ -466,27 +547,32 @@ static bool transfer_kv_in_memory(
 
             // Deserialize to destination
             bool checksum_ok = false;
+            auto t_deser_start = std::chrono::high_resolution_clock::now();
             size_t imported = llama_kv_stream_deserialize(
                 ctx_dst, seq_id, layer, layer_end,
-                disagg.kv_buffer.data(), actual_size, &checksum_ok);
+                disagg.kv_buffer.data(), actual_size, disable_kv_checksum ? nullptr : &checksum_ok);
+            auto t_deser_end = std::chrono::high_resolution_clock::now();
+            deserialize_ms += std::chrono::duration<double, std::milli>(t_deser_end - t_deser_start).count();
 
             if (imported == 0) {
                 LOG_ERR("Failed to import KV layers [%d, %d) for seq %d\n", layer, layer_end, seq_id);
                 return false;
             }
 
-            if (!checksum_ok) {
+            if (!disable_kv_checksum && !checksum_ok) {
                 LOG_WRN("Checksum mismatch for KV layers [%d, %d), seq %d\n", layer, layer_end, seq_id);
                 disagg.kv_stats.checksum_failures++;
             }
 
             total_transferred += actual_size;
+            frames_this++;
             layer = layer_end;
         }
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         llama_kv_transfer_stats_update(&disagg.kv_stats, total_transferred, time_ms, true);
+        bytes_this = total_transferred;
 
     } else {
         // Full KV transfer mode
@@ -500,9 +586,12 @@ static bool transfer_kv_in_memory(
             disagg.kv_buffer.resize(kv_size);
         }
 
+        auto t_ser_start = std::chrono::high_resolution_clock::now();
         size_t actual_size = llama_kv_frame_serialize(
             ctx_src, seq_id, LLAMA_KV_COMPRESSION_NONE,
             disagg.kv_buffer.data(), disagg.kv_buffer.size());
+        auto t_ser_end = std::chrono::high_resolution_clock::now();
+        serialize_ms = std::chrono::duration<double, std::milli>(t_ser_end - t_ser_start).count();
 
         if (actual_size == 0) {
             LOG_ERR("Failed to serialize KV cache for seq %d\n", seq_id);
@@ -510,15 +599,18 @@ static bool transfer_kv_in_memory(
         }
 
         bool checksum_ok = false;
+        auto t_deser_start = std::chrono::high_resolution_clock::now();
         size_t imported = llama_kv_frame_deserialize(
-            ctx_dst, seq_id, disagg.kv_buffer.data(), actual_size, &checksum_ok);
+            ctx_dst, seq_id, disagg.kv_buffer.data(), actual_size, disable_kv_checksum ? nullptr : &checksum_ok);
+        auto t_deser_end = std::chrono::high_resolution_clock::now();
+        deserialize_ms = std::chrono::duration<double, std::milli>(t_deser_end - t_deser_start).count();
 
         if (imported == 0) {
             LOG_ERR("Failed to import KV cache for seq %d\n", seq_id);
             return false;
         }
 
-        if (!checksum_ok) {
+        if (!disable_kv_checksum && !checksum_ok) {
             LOG_WRN("Checksum mismatch for seq %d\n", seq_id);
             disagg.kv_stats.checksum_failures++;
         }
@@ -526,12 +618,24 @@ static bool transfer_kv_in_memory(
         auto t_end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         llama_kv_transfer_stats_update(&disagg.kv_stats, actual_size, time_ms, true);
+        bytes_this = actual_size;
+        frames_this = 1;
     }
+
+    disagg.last_serialize_ms = serialize_ms;
+    disagg.last_send_ms = 0.0;
+    disagg.last_commit_ms = 0.0;
+    disagg.last_deserialize_ms = deserialize_ms;
+    disagg.last_bytes = bytes_this;
+    disagg.last_frames = frames_this;
 
     return true;
 }
 
 int main(int argc, char ** argv) {
+    bool disable_kv_checksum = false;
+    parse_local_flags(argc, argv, disable_kv_checksum);
+
     common_params params;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_BENCH, print_usage)) {
@@ -574,14 +678,99 @@ int main(int argc, char ** argv) {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
 
+    double model_size_gb = 0.0;
+    double model_load_time_s = 0.0;
+    std::string model_name = "";
+    // Use user-provided labels if available, otherwise use device specs
+    std::string prefill_device_label = params.prefill_device_label.empty() 
+        ? (params.prefill_devices.empty() ? "default" : params.prefill_devices[0])
+        : params.prefill_device_label;
+    std::string decode_device_label = params.decode_device_label.empty()
+        ? (params.decode_devices.empty() ? prefill_device_label : params.decode_devices[0])
+        : params.decode_device_label;
+
+    // Helper to extract actual device name from RPC description (e.g., "10.0.0.10:50052 (NVIDIA GB10)" -> "NVIDIA GB10")
+    auto extract_device_name = [](ggml_backend_dev_t dev) -> std::string {
+        if (!dev) return "unknown";
+        const char * desc = ggml_backend_dev_description(dev);
+        if (!desc) return ggml_backend_dev_name(dev);
+        
+        std::string desc_str(desc);
+        // Look for pattern like "endpoint (device_name)"
+        size_t paren_start = desc_str.find('(');
+        size_t paren_end = desc_str.find(')');
+        if (paren_start != std::string::npos && paren_end != std::string::npos && paren_end > paren_start) {
+            return desc_str.substr(paren_start + 1, paren_end - paren_start - 1);
+        }
+        // For local devices like Metal, CUDA, etc., the description is the full device name (e.g., "Apple M3 Ultra")
+        // Use the description directly if it's not empty and doesn't look like just a backend name
+        if (!desc_str.empty() && desc_str != ggml_backend_dev_name(dev)) {
+            return desc_str;
+        }
+        // Fallback to device name
+        return ggml_backend_dev_name(dev);
+    };
+
+    const auto print_table_header = []() {
+        LOG("|%6s | %6s | %4s | %6s | %-20s | %-20s | %-25s | %10s | %8s | %8s | %10s | %8s | %10s | %8s | %14s | %8s | %8s | %8s | %12s | %12s | %12s | %12s |\n",
+            "PP", "TG", "B", "N_KV", "Prefill Device", "Decode Device", "M", "GB_MODEL", "T_Load s",
+            "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s", "T_P+D s", "T_P+D+KVXfer s", "T_E2E s", "S t/s", "MB_KV", "T_KV_Xfer s", "T_KV_Ser s", "KV_send MB/s", "KV_E2E MB/s");
+        LOG("|%6s-|-%6s-|-%4s-|-%6s-|-%20s-|-%20s-|-%25s-|-%10s-|-%8s-|-%8s-|-%10s-|-%8s-|-%10s-|-%8s-|-%14s-|-%8s-|-%8s-|-%8s-|-%12s-|-%12s-|-%12s-|-%12s-|\n",
+            "------", "------", "----", "------", "--------------------", "--------------------", "-------------------------", "----------", "--------",
+            "--------", "----------", "--------", "----------", "--------", "--------------", "--------", "--------", "--------", "------------", "------------", "------------", "------------");
+    };
+
     if (!disagg.is_disaggregated) {
-        // Monolithic mode - single model and context
+        const int64_t t_load_model_start = ggml_time_us();
+
         llama_model_params model_params = common_model_params_to_llama(params);
         model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+
+        const int64_t t_load_model_end = ggml_time_us();
+        model_load_time_s += (t_load_model_end - t_load_model_start) / 1000000.0;
 
         if (model == NULL) {
             fprintf(stderr , "%s: error: unable to load model\n" , __func__);
             return 1;
+        }
+
+        model_size_gb = llama_model_size(model) / (1024.0 * 1024.0 * 1024.0);
+        char name_buf[256];
+        int name_len = llama_model_meta_val_str(model, "general.name", name_buf, sizeof(name_buf));
+        model_name = (name_len > 0) ? std::string(name_buf) : "unknown";
+        
+        // Detect actual device used if no custom label provided
+        if (params.prefill_device_label.empty() || params.decode_device_label.empty()) {
+            // Try to find the device that was used for model loading
+            if (model_params.devices && model_params.devices[0]) {
+                std::string detected_name = extract_device_name(model_params.devices[0]);
+                if (params.prefill_device_label.empty()) {
+                    prefill_device_label = detected_name;
+                }
+                if (params.decode_device_label.empty()) {
+                    decode_device_label = detected_name;
+                }
+            } else {
+                // No explicit device list, try to detect from available devices
+                // Look for first GPU device (Metal, CUDA, etc.)
+                ggml_backend_dev_t detected_dev = nullptr;
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        detected_dev = dev;
+                        break;
+                    }
+                }
+                if (detected_dev) {
+                    std::string detected_name = extract_device_name(detected_dev);
+                    if (params.prefill_device_label.empty()) {
+                        prefill_device_label = detected_name;
+                    }
+                    if (params.decode_device_label.empty()) {
+                        decode_device_label = detected_name;
+                    }
+                }
+            }
         }
 
         llama_context_params ctx_params = common_context_params_to_llama(params);
@@ -653,6 +842,14 @@ int main(int argc, char ** argv) {
         }
         LOG_INF("Decode device: %s\n", ggml_backend_dev_name(disagg.dev_decode));
 
+        // Only extract device names if user didn't provide custom labels
+        if (params.prefill_device_label.empty()) {
+            prefill_device_label = extract_device_name(disagg.dev_prefill);
+        }
+        if (params.decode_device_label.empty()) {
+            decode_device_label = extract_device_name(disagg.dev_decode);
+        }
+
         // Build device arrays (null-terminated)
         disagg.prefill_devices = { disagg.dev_prefill, nullptr };
         disagg.decode_devices = { disagg.dev_decode, nullptr };
@@ -667,11 +864,18 @@ int main(int argc, char ** argv) {
         llama_model_params model_params_prefill = common_model_params_to_llama(params);
         model_params_prefill.devices = disagg.prefill_devices.data();  // Force device selection
 
+        const int64_t t_load_prefill_start = ggml_time_us();
         disagg.model_prefill = llama_model_load_from_file(prefill_model_path.c_str(), model_params_prefill);
+        const int64_t t_load_prefill_end = ggml_time_us();
+        model_load_time_s += (t_load_prefill_end - t_load_prefill_start) / 1000000.0;
         if (!disagg.model_prefill) {
             fprintf(stderr, "ERROR: Failed to load model for prefill from: %s\n", prefill_model_path.c_str());
             return 1;
         }
+        model_size_gb = llama_model_size(disagg.model_prefill) / (1024.0 * 1024.0 * 1024.0);
+        char name_buf[256];
+        int name_len = llama_model_meta_val_str(disagg.model_prefill, "general.name", name_buf, sizeof(name_buf));
+        model_name = (name_len > 0) ? std::string(name_buf) : "unknown";
         LOG_INF("Model loaded on prefill tier\n");
 
         // Create context for prefill
@@ -693,7 +897,10 @@ int main(int argc, char ** argv) {
         llama_model_params model_params_decode = common_model_params_to_llama(params);
         model_params_decode.devices = disagg.decode_devices.data();  // Force device selection
 
+        const int64_t t_load_decode_start = ggml_time_us();
         disagg.model_decode = llama_model_load_from_file(decode_model_path.c_str(), model_params_decode);
+        const int64_t t_load_decode_end = ggml_time_us();
+        model_load_time_s += (t_load_decode_end - t_load_decode_start) / 1000000.0;
         if (!disagg.model_decode) {
             fprintf(stderr, "ERROR: Failed to load model for decode from: %s\n", decode_model_path.c_str());
             return 1;
@@ -735,6 +942,7 @@ int main(int argc, char ** argv) {
         } else {
             LOG_INF("  Streaming: Disabled\n");
         }
+        LOG_INF("  Checksum:  %s\n", disable_kv_checksum ? "Disabled" : "Enabled");
         LOG_INF("========================================\n\n");
 
         // Use prefill context as the primary one for warmup
@@ -804,21 +1012,12 @@ int main(int argc, char ** argv) {
         if (disagg.is_disaggregated) {
             LOG("%s: DISAGGREGATED MODE - prefill=%s, decode=%s\n", __func__,
                 params.prefill_devices[0].c_str(), params.decode_devices[0].c_str());
-            LOG("%s: NOTE: T_tot = T_PP + T_TG + T_KV (total time includes KV transfer)\n", __func__);
+            LOG("%s: NOTE: T_noKV = T_PP + T_TG, T s (run-only) = T_noKV + T_KV, End-to-End includes model load time\n", __func__);
+            LOG("%s: KV checksum: %s\n", __func__, disable_kv_checksum ? "disabled" : "enabled");
         }
         LOG("%s: n_kv_max = %d, n_batch = %d, n_ubatch = %d, flash_attn = %d, is_pp_shared = %d, is_tg_separate = %d, n_gpu_layers = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, params.n_batch, params.n_ubatch, int(params.flash_attn_type), is_pp_shared, is_tg_separate, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch);
         LOG("\n");
-        if (disagg.is_disaggregated) {
-            LOG("|%6s | %6s | %4s | %6s | %8s | %8s | %8s | %8s | %8s | %8s | %8s | %8s |\n",
-                "PP", "TG", "B", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s", "T_tot s", "S t/s", "KV_MB", "T_KV s");
-            LOG("|%6s-|-%6s-|-%4s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|\n",
-                "------", "------", "----", "------", "--------", "--------", "--------", "--------", "--------", "--------", "--------", "--------");
-        } else {
-            LOG("|%6s | %6s | %4s | %6s | %8s | %8s | %8s | %8s | %8s | %8s |\n",
-                "PP", "TG", "B", "N_KV", "T_PP s", "S_PP t/s", "T_TG s", "S_TG t/s", "T s", "S t/s");
-            LOG("|%6s-|-%6s-|-%4s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|\n",
-                "------", "------", "----", "------", "--------", "--------", "--------", "--------", "--------", "--------");
-        }
+        print_table_header();
     }
 
     for (        int i_pp = 0; i_pp < (int) n_pp.size(); ++i_pp) {
@@ -876,7 +1075,7 @@ int main(int argc, char ** argv) {
 
                 const auto t_pp_end = ggml_time_us();
 
-                // KV CACHE TRANSFER
+                // KV CACHE TRANSFER & SIZE CALCULATION
                 double kv_transfer_time_s = 0.0;
                 double kv_transfer_mb = 0.0;
 
@@ -889,12 +1088,12 @@ int main(int argc, char ** argv) {
                             // Phase 1: Network KV transfer via RPC
                             success = transfer_kv_via_rpc(
                                 disagg, disagg.ctx_prefill, j,
-                                params.kv_stream, params.kv_stream_every, n_layer);
+                                params.kv_stream, params.kv_stream_every, n_layer, disable_kv_checksum);
                         } else {
                             // Fallback: In-memory transfer (for local disaggregation testing)
                             success = transfer_kv_in_memory(
                                 disagg, disagg.ctx_prefill, disagg.ctx_decode, j,
-                                params.kv_stream, params.kv_stream_every, n_layer);
+                                params.kv_stream, params.kv_stream_every, n_layer, disable_kv_checksum);
                         }
 
                         if (!success) {
@@ -904,7 +1103,22 @@ int main(int argc, char ** argv) {
                     }
 
                     kv_transfer_time_s = disagg.kv_stats.transfer_time_ms / 1000.0;
+                    // Update with actual transferred bytes in disaggregated mode
                     kv_transfer_mb = disagg.kv_stats.bytes_sent / (1024.0 * 1024.0);
+                } else {
+                    // In non-disaggregated mode: calculate KV cache size (no actual transfer)
+                    llama_memory_t mem_active = llama_get_memory(ctx);
+                    size_t total_kv_bytes = 0;
+
+                    for (int j = 0; j < (is_pp_shared ? 1 : pl); ++j) {
+                        // Check if sequence exists (has any tokens)
+                        llama_pos pos_max = llama_memory_seq_pos_max(mem_active, j);
+                        if (pos_max >= 0) {
+                            total_kv_bytes += llama_state_seq_get_size(ctx, j);
+                        }
+                    }
+
+                    kv_transfer_mb = total_kv_bytes / (1024.0 * 1024.0);
                 }
 
                 // SEQUENCE COPY (if pp_shared)
@@ -971,13 +1185,18 @@ int main(int argc, char ** argv) {
                 const float t_pp = (t_pp_end - t_pp_start) / 1000000.0f;
                 const float t_tg = (t_tg_end - t_tg_start) / 1000000.0f;
                 // Total time includes KV transfer time for disaggregated mode
-                const float t_kv = disagg.is_disaggregated ? (float)kv_transfer_time_s : 0.0f;
-                const float t    = t_pp + t_tg + t_kv;
+                const float t_kv   = disagg.is_disaggregated ? (float)kv_transfer_time_s : 0.0f;
+                const float t_no_kv = t_pp + t_tg;
+                const float t       = t_no_kv + t_kv;
 
                 const float speed_pp = is_pp_shared ? pp / t_pp : pl*pp / t_pp;
                 const float speed_tg = pl*tg / t_tg;
                 // Speed calculation uses total time including KV transfer
                 const float speed    = ((is_pp_shared ? pp : pl*pp) + pl*tg) / t;
+                const float speed_kv = (disagg.is_disaggregated && kv_transfer_time_s > 0.0) ? (float)(kv_transfer_mb / kv_transfer_time_s) : 0.0f;
+                const float speed_kv_wire = (disagg.is_disaggregated && disagg.last_send_ms > 0.0) ? (float)((disagg.last_bytes / (1024.0 * 1024.0)) / (disagg.last_send_ms / 1000.0)) : 0.0f;
+                const float serialize_s = (float)(disagg.last_serialize_ms / 1000.0);
+                const double end_to_end_time_s = t + model_load_time_s;
 
                 if(params.batched_bench_output_jsonl) {
                     if (disagg.is_disaggregated) {
@@ -998,13 +1217,10 @@ int main(int argc, char ** argv) {
                         );
                     }
                 } else {
-                    if (disagg.is_disaggregated) {
-                        LOG("|%6d | %6d | %4d | %6d | %8.3f | %8.2f | %8.3f | %8.2f | %8.3f | %8.2f | %8.2f | %8.3f |\n",
-                            pp, tg, pl, n_kv, t_pp, speed_pp, t_tg, speed_tg, t, speed, kv_transfer_mb, kv_transfer_time_s);
-                    } else {
-                        LOG("|%6d | %6d | %4d | %6d | %8.3f | %8.2f | %8.3f | %8.2f | %8.3f | %8.2f |\n",
-                            pp, tg, pl, n_kv, t_pp, speed_pp, t_tg, speed_tg, t, speed);
-                    }
+                    LOG("|%6d | %6d | %4d | %6d | %-20s | %-20s | %-25s | %10.2f | %8.3f | %8.3f | %10.2f | %8.3f | %10.2f | %8.3f | %14.3f | %8.3f | %8.2f | %8.2f | %12.3f | %12.3f | %12.2f | %12.2f |\n",
+                        pp, tg, pl, n_kv, prefill_device_label.c_str(), decode_device_label.c_str(), model_name.c_str(), model_size_gb, model_load_time_s,
+                        t_pp, speed_pp, t_tg, speed_tg, t_no_kv, t, end_to_end_time_s, speed, kv_transfer_mb, kv_transfer_time_s,
+                        serialize_s, speed_kv_wire, speed_kv);
                 }
             }
         }
@@ -1022,10 +1238,25 @@ int main(int argc, char ** argv) {
             LOG("Stream every N layers: %d\n", params.kv_stream_every);
         }
         LOG("Total KV transferred: %.2f MB\n", disagg.kv_stats.bytes_sent / (1024.0 * 1024.0));
-        LOG("Total transfer time:  %.3f s (included in T_tot)\n", disagg.kv_stats.transfer_time_ms / 1000.0);
-        LOG("Average bandwidth:    %.2f MB/s\n", (disagg.kv_stats.bytes_sent / (1024.0 * 1024.0)) / (disagg.kv_stats.transfer_time_ms / 1000.0));
+        LOG("Total transfer time:  %.3f s (included in T)\n", disagg.kv_stats.transfer_time_ms / 1000.0);
+        LOG("KV throughput (E2E): %.2f MB/s\n", (disagg.kv_stats.bytes_sent / (1024.0 * 1024.0)) / (disagg.kv_stats.transfer_time_ms / 1000.0));
         LOG("Total frames:         %d\n", disagg.kv_stats.frame_count);
         LOG("Checksum failures:    %d\n", disagg.kv_stats.checksum_failures);
+        if (disagg.last_bytes > 0) {
+            LOG("Last transfer detail:\n");
+            LOG("  Serialize:    %.3f s\n", disagg.last_serialize_ms / 1000.0);
+            if (disagg.use_network_kv_transfer) {
+                LOG("  Send:         %.3f s\n", disagg.last_send_ms / 1000.0);
+                LOG("  Commit:       %.3f s\n", disagg.last_commit_ms / 1000.0);
+                if (disagg.last_send_ms > 0.0) {
+                    LOG("  Wire BW:      %.2f MB/s\n", (disagg.last_bytes / (1024.0 * 1024.0)) / (disagg.last_send_ms / 1000.0));
+                }
+            } else {
+                LOG("  Deserialize:  %.3f s\n", disagg.last_deserialize_ms / 1000.0);
+            }
+            LOG("  Bytes:        %.2f MB\n", disagg.last_bytes / (1024.0 * 1024.0));
+            LOG("  Frames:       %d\n", disagg.last_frames);
+        }
         LOG("----------------------------------------\n");
         LOG("Prefill device:       %s\n", disagg.dev_prefill ? ggml_backend_dev_name(disagg.dev_prefill) : "default");
         LOG("Decode device:        %s\n", disagg.dev_decode ? ggml_backend_dev_name(disagg.dev_decode) : "default");

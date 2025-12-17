@@ -2696,6 +2696,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
+        {"--prefill-device-label"}, "STRING",
+        "friendly label for prefill device (e.g., 'NVIDIA GB10')",
+        [](common_params & params, const std::string & value) {
+            params.prefill_device_label = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--decode-device-label"}, "STRING",
+        "friendly label for decode device (e.g., 'Apple M3 Ultra')",
+        [](common_params & params, const std::string & value) {
+            params.decode_device_label = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
         {"--disagg"},
         "explicitly enable disaggregated prefill-decode mode",
         [](common_params & params) {

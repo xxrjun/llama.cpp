@@ -525,6 +525,8 @@ struct common_params {
     // prefill-decode disaggregation params
     std::vector<std::string> prefill_devices;  // devices for prefill (e.g., "RPC@ip:port", "CUDA0")
     std::vector<std::string> decode_devices;   // devices for decode (e.g., "Metal", "CPU")
+    std::string prefill_device_label = "";    // optional friendly label for prefill device (e.g., "NVIDIA GB10")
+    std::string decode_device_label  = "";    // optional friendly label for decode device (e.g., "Apple M3 Ultra")
     bool disagg                = false;        // explicitly enable disaggregated mode
     bool topology              = false;        // display topology information
     std::string topology_file  = "";           // path to topology config file (YAML)
